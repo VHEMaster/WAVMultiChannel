@@ -78,6 +78,8 @@ extern UART_HandleTypeDef huart3;
 #define SAMPLE_BUFFER_SIZE  (2048)
 #define FILE_BUFFER_SIZE    (16384)
 #define MAX_FILE_PATH       (128)
+#define TDM_TEMP_BUFFER_SIZE (TDM_BUFFER_SIZE / CHANNELS_PER_TDM)
+#define TDM_TEMP_HALF_BUFFER_SIZE (TDM_TEMP_BUFFER_SIZE / 2)
 
 uint8_t gMixer[CHANNELS_COUNT][PLAYERS_COUNT];
 
@@ -95,6 +97,7 @@ volatile uint32_t gMp3LedLast = 0;
 #define TDM_BUFFER_SIZE (256 * CHANNELS_PER_TDM)
 static SAI_HandleTypeDef  *const gSai[TDM_COUNT] = { &hsai_BlockA1, &hsai_BlockB1, &hsai_BlockA2, &hsai_BlockB2 };
 static int16_t gTdmFinalBuffers[TDM_COUNT][TDM_BUFFER_SIZE] __attribute__((aligned(32)));
+static int16_t gTdmTempHalfBuffers[PLAYERS_COUNT][TDM_TEMP_HALF_BUFFER_SIZE];
 
 typedef struct {
     uint32_t index;
@@ -167,6 +170,7 @@ static void HandleSaiDma(int sai_index, int16_t *buffer, uint32_t size)
   int buffer_index;
   int channel_index;
   int32_t value;
+  int16_t data;
   int available[PLAYERS_COUNT] = {0};
 
   for(int j = 0; j < samples_per_channel; j++)
@@ -187,13 +191,21 @@ static void HandleSaiDma(int sai_index, int16_t *buffer, uint32_t size)
               }
             }
           }
-          if(available[player] == 1) {
-            value += gPlayersData.player[player].buffer[gPlayersData.player[player].buffer_rd];
+          if(available[player] > 0) {
+            data = 0;
+            if(available[player] == 1) {
+              data = gPlayersData.player[player].buffer[gPlayersData.player[player].buffer_rd];
+              if(gPlayersData.player[player].buffer_rd + 1 >= gPlayersData.player[player].bufferSize)
+                gPlayersData.player[player].buffer_rd = 0;
+              else gPlayersData.player[player].buffer_rd++;
 
-            if(gPlayersData.player[player].buffer_rd + 1 >= gPlayersData.player[player].bufferSize)
-              gPlayersData.player[player].buffer_rd = 0;
-            else gPlayersData.player[player].buffer_rd++;
+              gTdmTempHalfBuffers[player][j] = data;
+              available[player] = 2;
+            } else if(available[player] == 2) {
+              data = gTdmTempHalfBuffers[player][j];
+            }
 
+            value += data;
           }
         }
       }
