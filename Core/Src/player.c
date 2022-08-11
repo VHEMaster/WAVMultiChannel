@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <limits.h>
 
 osThreadId_t taskIdleHandle;
 
@@ -70,11 +71,15 @@ extern UART_HandleTypeDef huart3;
 #define UART_TX_BUFFER 256
 #define UART_RX_BUFFER 256
 
-#define TDM_COUNT 4
+#define TDM_COUNT           (4)
+#define CHANNELS_COUNT      (64)
 #define PLAYERS_COUNT       (32)
+#define CHANNELS_PER_TDM    (CHANNELS_COUNT / TDM_COUNT)
 #define SAMPLE_BUFFER_SIZE  (2048)
 #define FILE_BUFFER_SIZE    (16384)
 #define MAX_FILE_PATH       (128)
+
+uint8_t gMixer[CHANNELS_COUNT][PLAYERS_COUNT];
 
 int16_t gSamplesBuffer[PLAYERS_COUNT][SAMPLE_BUFFER_SIZE];
 uint8_t gFileBuffer[PLAYERS_COUNT][FILE_BUFFER_SIZE];
@@ -87,15 +92,17 @@ volatile float gCpuLoadMax = 0;
 volatile uint32_t gIdleTick = 1000;
 volatile uint32_t gMp3LedLast = 0;
 
-#define TDM_BUFFER_SIZE 8192
+#define TDM_BUFFER_SIZE (256 * CHANNELS_PER_TDM)
 static SAI_HandleTypeDef  *const gSai[TDM_COUNT] = { &hsai_BlockA1, &hsai_BlockB1, &hsai_BlockA2, &hsai_BlockB2 };
-static uint16_t gTdmFinalBuffers[TDM_COUNT][TDM_BUFFER_SIZE] __attribute__((aligned(32)));
+static int16_t gTdmFinalBuffers[TDM_COUNT][TDM_BUFFER_SIZE] __attribute__((aligned(32)));
 
 typedef struct {
+    uint32_t index;
     const char *name;
     char file[MAX_FILE_PATH];
     volatile uint8_t enabled;
     volatile uint8_t playing;
+    volatile uint8_t play_once;
     volatile uint8_t changed;
     uint8_t volume;
     osThreadId_t task;
@@ -154,34 +161,45 @@ static inline uint32_t getfree(uint32_t wr, uint32_t rd, uint32_t size) {
   return size - getavail(wr, rd, size);
 }
 
-static void HandleSaiDma(int sai_index, uint16_t *buffer, uint32_t size)
+static void HandleSaiDma(int sai_index, int16_t *buffer, uint32_t size)
 {
-  uint32_t samples_per_channel = size / PLAYERS_COUNT / 2;
-  int index;
+  uint32_t samples_per_channel = size / CHANNELS_PER_TDM;
+  int buffer_index;
+  int channel_index;
+  int32_t value;
+  int available[PLAYERS_COUNT] = {0};
 
-  for(int i = 0; i < PLAYERS_COUNT; i++)
+  for(int j = 0; j < samples_per_channel; j++)
   {
-    if(getavail(gPlayersData.player[i].buffer_wr, gPlayersData.player[i].buffer_rd, gPlayersData.player[i].bufferSize) >= samples_per_channel)
+    for(int i = 0; i < CHANNELS_PER_TDM; i++)
     {
-      for(int j = 0; j < samples_per_channel; j++)
-      {
-        index = (((j & ~1) * PLAYERS_COUNT) + (i << 1) + (j & 1)) << 1;
-        buffer[index] = gPlayersData.player[i].buffer[gPlayersData.player[i].buffer_rd];
-        buffer[index + 1] = 0;
-        if(gPlayersData.player[i].buffer_rd + 1 >= gPlayersData.player[i].bufferSize)
-          gPlayersData.player[i].buffer_rd = 0;
-        else gPlayersData.player[i].buffer_rd++;
+      channel_index = i + sai_index * CHANNELS_PER_TDM;
+      buffer_index = j * CHANNELS_PER_TDM + i;
+      value = 0;
+
+      for(int player = 0; player < PLAYERS_COUNT; player++) {
+        if(gMixer[channel_index][player]) {
+          if(!available[player]) {
+            available[player] = getavail(gPlayersData.player[player].buffer_wr, gPlayersData.player[player].buffer_rd, gPlayersData.player[player].bufferSize) >= samples_per_channel ? 1 : -1;
+            if(available[player] == -1) {
+              if(gPlayersData.player[player].playing) {
+                gPlayersData.player[player].underflow_rd++;
+              }
+            }
+          }
+          if(available[player] == 1) {
+            value += gPlayersData.player[player].buffer[gPlayersData.player[player].buffer_rd];
+
+            if(gPlayersData.player[player].buffer_rd + 1 >= gPlayersData.player[player].bufferSize)
+              gPlayersData.player[player].buffer_rd = 0;
+            else gPlayersData.player[player].buffer_rd++;
+
+          }
+        }
       }
-    } else {
-      if(gPlayersData.player[i].playing) {
-        gPlayersData.player[i].underflow_rd++;
-      }
-      for(int j = 0; j < samples_per_channel; j++)
-      {
-        index = (((j & ~1) * PLAYERS_COUNT) + (i << 1) + (j & 1)) << 1;
-        buffer[index] = 0;
-        buffer[index + 1] = 0;
-      }
+
+      buffer[buffer_index] = value > SHRT_MAX ? SHRT_MAX : value < SHRT_MIN ? SHRT_MIN : value;
+
     }
   }
 
@@ -290,6 +308,9 @@ void player_start(void)
   sPlayersData *playersdata = &gPlayersData;
   char *str = NULL;
   char *args = NULL;
+  uint32_t channel;
+  uint32_t enabled;
+  uint32_t play_once;
   uint32_t len = 0;
   uint32_t arg;
   uint32_t tick;
@@ -321,16 +342,21 @@ void player_start(void)
   HAL_UART_Receive_DMA(gCommData.huart, gCommData.rx_buffer, UART_RX_BUFFER);
 
   memset(gTdmFinalBuffers, 0, sizeof(gTdmFinalBuffers));
+  memset(gMixer, 0, sizeof(gMixer));
 
+  gFSMutex = osMutexNew(&mutexFS_attributes);
   for(int i = 0; i < PLAYERS_COUNT; i++) {
     memset(&playersdata->player[i], 0, sizeof(playersdata->player[i]));
+    if(i * 2 < CHANNELS_COUNT)
+      gMixer[i * 2][i] = 1;
 
     str = (char *)pvPortMalloc(12); sprintf(str, "player%d", i+1); playersdata->player[i].name = str;
     str = (char *)pvPortMalloc(16); sprintf(str, "mutexPlayer%d", i+1); mutexPlayer_attributes.name = str;
     str = (char *)pvPortMalloc(16); sprintf(str, "taskPlayer%d", i+1); taskPlayer_attributes.name = str;
 
-    sprintf(playersdata->player[i].file, "music/%d.mp3", i+1);
+    sprintf(playersdata->player[i].file, "music/%d.wav", i+1);
 
+    playersdata->player[i].index = i;
     playersdata->player[i].enabled = 0;
     playersdata->player[i].playing = 0;
     playersdata->player[i].volume = 100;
@@ -378,11 +404,28 @@ void player_start(void)
             args = &str[arg_start + 1];
             str[arg_start] = '\0';
             str[arg_end] = '\0';
-            if(strcmp(str, "play") == 0) {
+            if((play_once = (strcmp(str, "play_once") == 0)) || (strcmp(str, "play") == 0)) {
               osMutexAcquire(gPlayersData.player[i].mutex, osWaitForever);
               strcpy(gPlayersData.player[i].file, args);
               gPlayersData.player[i].enabled = 1;
+              gPlayersData.player[i].play_once = play_once;
               gPlayersData.player[i].changed = 1;
+              osMutexRelease(gPlayersData.player[i].mutex);
+              Comm_Transmit(&gCommData, "OK");
+            } else if(strcmp(str, "mixer") == 0) {
+              osMutexAcquire(gPlayersData.player[i].mutex, osWaitForever);
+              if(sscanf(args, "%lu,%lu", &channel, &enabled) == 2) {
+                channel -= 1;
+                if(channel < CHANNELS_COUNT && (enabled == 1 || enabled == 0)) {
+                  gMixer[channel][i] = enabled;
+                  Comm_Transmit(&gCommData, "OK");
+                }
+              }
+              osMutexRelease(gPlayersData.player[i].mutex);
+            } else if(strcmp(str, "mixer_disable") == 0) {
+              osMutexAcquire(gPlayersData.player[i].mutex, osWaitForever);
+              for(channel = 0; channel < CHANNELS_COUNT; channel++)
+                gMixer[channel][i] = 0;
               osMutexRelease(gPlayersData.player[i].mutex);
               Comm_Transmit(&gCommData, "OK");
             } else if(strcmp(str, "stop") == 0) {
@@ -461,12 +504,77 @@ void player_start(void)
   }
 }
 
+static volatile uint32_t gOpened = 0;
+static volatile uint32_t gWriten = 0;
+static volatile uint32_t times[PLAYERS_COUNT];
+static volatile float speeds[PLAYERS_COUNT];
+
 void StartPlayerTask(void *args)
 {
   sPlayerData *playerdata = (sPlayerData *)args;
+  FRESULT res;
+  FIL file;
+  uint32_t size;
+  uint32_t block;
+  uint32_t left;
+  uint32_t time;
+  UINT read = 0;
+
+
+  osMutexAcquire(gFSMutex, osWaitForever);
+  res = f_open(&file, playerdata->file, FA_READ);
+  osMutexRelease(gFSMutex);
+  if(res != FR_OK) {
+    vTaskSuspendAll();
+    while(1) {
+      HAL_Delay(500);
+      HAL_GPIO_TogglePin(LED3_RED_GPIO_Port, LED3_RED_Pin);
+    }
+  }
+
+  taskENTER_CRITICAL();
+  gOpened++;
+  taskEXIT_CRITICAL();
+
+  time = xTaskGetTickCount();
+
+  size = f_size(&file);
+  left = size;
 
   while(1) {
-    osDelay(1);
+    time = xTaskGetTickCount();
+    gMp3LedLast = time;
+
+    block = left;
+    if(block > playerdata->fileBufferSize)
+      block = playerdata->fileBufferSize;
+
+    osMutexAcquire(gFSMutex, osWaitForever);
+    res = f_read(&file, playerdata->fileBuffer, block, &read);
+    osMutexRelease(gFSMutex);
+
+    if(res != FR_OK) {
+      vTaskSuspendAll();
+      while(1) {
+        HAL_Delay(500);
+        HAL_GPIO_TogglePin(LED3_RED_GPIO_Port, LED3_RED_Pin);
+      }
+    }
+
+    left -= block;
+    if(!left) {
+      osMutexAcquire(gFSMutex, osWaitForever);
+      res = f_rewind(&file);
+      osMutexRelease(gFSMutex);
+
+      left = size;
+
+      times[playerdata->index] = xTaskGetTickCount() - time;
+      speeds[playerdata->index] = ((float)size / ((float)times[playerdata->index] / 1000.0f)) / 1024.0f / 1024.0f;
+      if(playerdata->index == 0)
+        HAL_GPIO_TogglePin(LED2_YELLOW_GPIO_Port, LED2_YELLOW_Pin);
+    }
+    //osDelay(1);
   }
 }
 
