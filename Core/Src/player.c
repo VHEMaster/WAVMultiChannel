@@ -76,7 +76,7 @@ extern UART_HandleTypeDef huart3;
 #define TDM_COUNT           (4)
 #define CHANNELS_COUNT      (64)
 #define PLAYERS_COUNT       (32)
-#define TDM_SAMPLES_COUNT   (32)
+#define TDM_SAMPLES_COUNT   (128)
 #define CHANNELS_PER_TDM    (CHANNELS_COUNT / TDM_COUNT)
 #define SAMPLE_BUFFER_SIZE  (2048)
 #define FILE_BUFFER_SIZE    (16384)
@@ -98,12 +98,13 @@ static osMutexId_t gFSMutex;
 
 volatile float gCpuLoad = 0;
 volatile float gCpuLoadMax = 0;
-volatile uint32_t gIdleTick = 1000;
+volatile uint32_t gIdleTick = 10000;
 volatile uint32_t gMp3LedLast = 0;
 
 static SAI_HandleTypeDef  *const gSai[TDM_COUNT] = { &hsai_BlockA1, &hsai_BlockB1, &hsai_BlockA2, &hsai_BlockB2 };
 static RAM_ALIGNED_32 int16_t gTdmFinalBuffers[TDM_COUNT][TDM_BUFFER_SIZE] = {{0}};
-static RAM_DTCM1 int16_t gPlayersTempBuffer[PLAYERS_COUNT][TDM_SAMPLES_COUNT] = {{0}};
+static RAM_DTCM1 int16_t gPlayersTempBufferL[PLAYERS_COUNT][TDM_SAMPLES_COUNT] = {{0}};
+static RAM_DTCM1 int16_t gPlayersTempBufferR[PLAYERS_COUNT][TDM_SAMPLES_COUNT] = {{0}};
 static RAM_DTCM1 int32_t gChannelSamples[TDM_SAMPLES_COUNT] = {0};
 static RAM_DTCM1 int8_t gPlayersAvailable[PLAYERS_COUNT] = {0};
 
@@ -127,12 +128,9 @@ typedef struct {
     uint32_t buffer_rd;
     uint32_t buffer_wr;
     uint32_t underflow_rd;
+    uint32_t wav_errors;
     uint32_t fs_errors;
     float file_percentage;
-    uint32_t samplerate;
-    uint32_t bytespersample;
-    uint32_t startpos;
-    uint32_t endpos;
 }sPlayerData;
 
 typedef struct {
@@ -178,6 +176,10 @@ static inline uint32_t getfree(uint32_t wr, uint32_t rd, uint32_t size) {
   return size - getavail(wr, rd, size);
 }
 
+volatile uint32_t DEBUG_TIME = 0;
+volatile uint32_t DEBUG_PERIOD = 0;
+uint32_t debug_time = 0;
+
 static void HandleSaiDma(int16_t *buffer[TDM_COUNT], uint32_t size)
 {
   uint32_t samples_per_channel = size / CHANNELS_PER_TDM;
@@ -185,6 +187,9 @@ static void HandleSaiDma(int16_t *buffer[TDM_COUNT], uint32_t size)
   int32_t sample;
   int32_t mono;
   int16_t *samples;
+
+  DEBUG_PERIOD = TICK_US - debug_time;
+  debug_time = TICK_US;
 
   memset(gPlayersAvailable, 0, sizeof(gPlayersAvailable));
 
@@ -194,6 +199,16 @@ static void HandleSaiDma(int16_t *buffer[TDM_COUNT], uint32_t size)
 
       for(int player = 0; player < PLAYERS_COUNT; player++) {
         if(gMixer[channel][player]) {
+          samples = NULL;
+
+          if(gPlayersData.player[player].channels == 1) {
+            samples = gPlayersTempBufferL[player];
+          } else if(gPlayersData.player[player].channels == 2) {
+            samples = (gMixer[channel][player] == 2) ?
+                gPlayersTempBufferL[player] : gMixer[channel][player] == 3 ?
+                    gPlayersTempBufferR[player] : NULL;
+          }
+
           if(gPlayersAvailable[player] == 0) {
             gPlayersAvailable[player] = getavail(gPlayersData.player[player].buffer_wr, gPlayersData.player[player].buffer_rd, gPlayersData.player[player].bufferSize) >= samples_per_channel ? 1 : -1;
             if(gPlayersAvailable[player] == -1) {
@@ -205,30 +220,34 @@ static void HandleSaiDma(int16_t *buffer[TDM_COUNT], uint32_t size)
           if(gPlayersAvailable[player] > 0) {
             if(gPlayersAvailable[player] == 1) {
               gPlayersAvailable[player] = 2;
-              if(gPlayersData.player[player].channels == 1) {
-                samples = gPlayersData.player[player].bufferl;
-              } else if(gPlayersData.player[player].channels == 2) {
-                samples = (gMixer[channel][player] == 2) ?
-                    gPlayersData.player[player].bufferl : gMixer[channel][player] == 3 ?
-                        gPlayersData.player[player].bufferr : NULL;
-              }
+
               for(int i = 0; i < samples_per_channel; i++) {
-                if(samples) {
-                  gPlayersTempBuffer[player][i] = samples[gPlayersData.player[player].buffer_rd];
-                } else {
-                  mono = gPlayersData.player[player].bufferl[gPlayersData.player[player].buffer_rd];
-                  mono += gPlayersData.player[player].bufferr[gPlayersData.player[player].buffer_rd];
-                  mono >>= 1;
-                  gPlayersTempBuffer[player][i] = mono;
-                }
+                gPlayersTempBufferL[player][i] = gPlayersData.player[player].bufferl[gPlayersData.player[player].buffer_rd];
+                gPlayersTempBufferR[player][i] = gPlayersData.player[player].bufferr[gPlayersData.player[player].buffer_rd];
+
                 if(gPlayersData.player[player].buffer_rd + 1 >= gPlayersData.player[player].bufferSize)
                   gPlayersData.player[player].buffer_rd = 0;
                 else gPlayersData.player[player].buffer_rd++;
-                gChannelSamples[i] += gPlayersTempBuffer[player][i];
+
+                if(samples) {
+                  gChannelSamples[i] += samples[i];
+                } else {
+                  mono = gPlayersTempBufferL[player][i];
+                  mono += gPlayersTempBufferR[player][i];
+                  mono /= 2;
+                  gChannelSamples[i] += mono;
+                }
               }
             } else if(gPlayersAvailable[player] == 2) {
               for(int i = 0; i < samples_per_channel; i++) {
-                gChannelSamples[i] += gPlayersTempBuffer[player][i];
+                if(samples) {
+                  gChannelSamples[i] += samples[i];
+                } else {
+                  mono = gPlayersTempBufferL[player][i];
+                  mono += gPlayersTempBufferR[player][i];
+                  mono /= 2;
+                  gChannelSamples[i] += mono;
+                }
               }
             }
           }
@@ -247,49 +266,9 @@ static void HandleSaiDma(int16_t *buffer[TDM_COUNT], uint32_t size)
     SCB_CleanDCache_by_Addr((uint32_t *)buffer[tdm], size * sizeof(*buffer[tdm]));
   }
 
-  /*
-  for(int j = 0; j < samples_per_channel; j++)
-  {
-    for(int i = 0; i < CHANNELS_PER_TDM; i++)
-    {
-      channel_index = i + sai_index * CHANNELS_PER_TDM;
-      buffer_index = j * CHANNELS_PER_TDM + i;
-      value = 0;
 
-      for(int player = 0; player < PLAYERS_COUNT; player++) {
-        if(gMixer[channel_index][player]) {
-          if(gAvailable[player] == 0) {
-            gAvailable[player] = getavail(gPlayersData.player[player].buffer_wr, gPlayersData.player[player].buffer_rd, gPlayersData.player[player].bufferSize) >= samples_per_channel ? 1 : -1;
-            if(gAvailable[player] == -1) {
-              if(gPlayersData.player[player].playing) {
-                gPlayersData.player[player].underflow_rd++;
-              }
-            }
-          }
-          if(gAvailable[player] > 0) {
-            data = 0;
-            if(gAvailable[player] == 1) {
-              data = gPlayersData.player[player].buffer[gPlayersData.player[player].buffer_rd];
-              if(gPlayersData.player[player].buffer_rd + 1 >= gPlayersData.player[player].bufferSize)
-                gPlayersData.player[player].buffer_rd = 0;
-              else gPlayersData.player[player].buffer_rd++;
+  DEBUG_TIME = TICK_US - debug_time;
 
-              gTdmTempHalfBuffers[player][j] = data;
-              gAvailable[player] = 2;
-            } else if(gAvailable[player] == 2) {
-              data = gTdmTempHalfBuffers[player][j];
-            }
-
-            value += data;
-          }
-        }
-      }
-
-      buffer[buffer_index] = value > SHRT_MAX ? SHRT_MAX : value < SHRT_MIN ? SHRT_MIN : value;
-
-    }
-  }
-  */
 }
 
 void HAL_SAI_TxCpltCallback(SAI_HandleTypeDef *hsai)
@@ -464,6 +443,7 @@ void player_start(void)
     playersdata->player[i].fileBuffer = gFileBuffer[i];
 
     playersdata->player[i].task = osThreadNew(StartPlayerTask, &playersdata->player[i], &taskPlayer_attributes);
+    playersdata->player[i].mutex = osMutexNew(&mutexPlayer_attributes);
   }
 
   taskIdleHandle = osThreadNew(StartIdleTask, NULL, &taskIdle_attributes);
@@ -505,7 +485,7 @@ void player_start(void)
               Comm_Transmit(&gCommData, "OK");
             } else if(strcmp(str, "mixer") == 0) {
               osMutexAcquire(gPlayersData.player[i].mutex, osWaitForever);
-              if(sscanf(args, "%lu,%lu,%lu", &channel, &mixer, &enabled) == 2) {
+              if(sscanf(args, "%lu,%lu,%lu", &channel, &mixer, &enabled) == 3) {
                 channel -= 1;
                 if(channel < CHANNELS_COUNT &&
                    (enabled == 1 || enabled == 0) &&
@@ -542,7 +522,7 @@ void player_start(void)
     }
 
     taskENTER_CRITICAL();
-    if(HAL_GetTick() - gMp3LedLast > 1000) {
+    if(HAL_GetTick() - gMp3LedLast > 10000) {
       gMp3LedLast = HAL_GetTick();
       HAL_GPIO_WritePin(LED2_YELLOW_GPIO_Port, LED2_YELLOW_Pin, GPIO_PIN_RESET);
     }
@@ -552,17 +532,17 @@ void player_start(void)
 
     tms = HAL_GetTick();
 
-    if(ms != tms) {
+    while(ms != tms) {
       ms++;
 
-      if(ms % 1000 == 0) {
+      if(ms % 10000 == 0) {
 
         sdstats = BSP_SD_GetStats();
 
-        if(gIdleTick > 1000)
-          gIdleTick = 1000;
+        if(gIdleTick > 10000)
+          gIdleTick = 10000;
 
-        gCpuLoad = (float)(1000 - gIdleTick) * 0.1f;
+        gCpuLoad = (float)(10000 - gIdleTick) * 0.01f;
         gIdleTick = 0;
 
         if(gCpuLoadMax < gCpuLoad)
@@ -601,15 +581,264 @@ void player_start(void)
 }
 
 
-void StartPlayerTask(void *args)
+void StartPlayerTask(void *arg)
 {
-  sPlayerData *playerdata = (sPlayerData *)args;
+  sPlayerData *playerdata = (sPlayerData *)arg;
+
+  int16_t *bufferl = NULL;
+  int16_t *bufferr = NULL;
+  uint8_t *filebuffer = NULL;
+  uint32_t filebuffersize = 0;
+  uint8_t play_once = 0;
+  uint8_t playing = 0;
+  uint8_t enabled = 0;
+  uint8_t changed = 0;
+  uint8_t restart = 0;
+  float volume = 1.0f;
+
+  FIL file = {0};
   FRESULT res;
-  FIL file;
+  UINT read;
+  uint32_t toread = 0;
+  uint32_t content = 0;
 
-  while(1) {
+  uint8_t *tempfilebuffer;
 
-    //osDelay(1);
+  uint32_t samplerate = 0;
+  uint32_t chunksize = 0;
+  uint16_t blockalign = 0;
+  uint16_t bitpersample = 0;
+  uint16_t channels = 0;
+  uint16_t format = 0;
+
+  uint32_t output_samples = 0;
+  uint8_t can_play = 0;
+  uint32_t bytes_needed = 0;
+
+  playing = 0;
+
+  while(1)
+  {
+    filebuffer = playerdata->fileBuffer;
+    filebuffersize = playerdata->fileBufferSize;
+    bufferl = playerdata->bufferl;
+    bufferr = playerdata->bufferr;
+
+    if(osMutexAcquire(playerdata->mutex, osWaitForever) == osOK) {
+      volume = playerdata->volume * 0.01f;
+      enabled = playerdata->enabled;
+      changed = playerdata->changed;
+      osMutexRelease(playerdata->mutex);
+    }
+
+    if(changed || restart) {
+      if(osMutexAcquire(playerdata->mutex, 0) == osOK) {
+        restart = 0;
+        playerdata->changed = 0;
+        if(playing) {
+          playing = 0;
+          osMutexRelease(playerdata->mutex);
+          content = 0;
+          chunksize = 0;
+          can_play = 0;
+          osMutexAcquire(gFSMutex, osWaitForever);
+          res = f_close(&file);
+          osMutexRelease(gFSMutex);
+          if(res != FR_OK) {
+
+          }
+        } else {
+          osMutexRelease(playerdata->mutex);
+        }
+
+        if(enabled) {
+          content = 0;
+          osMutexAcquire(gFSMutex, osWaitForever);
+          res = f_open(&file, playerdata->file, FA_READ);
+          osMutexRelease(gFSMutex);
+          if(res != FR_OK) {
+            playerdata->enabled = 0;
+            enabled = 0;
+            playing = 0;
+          } else {
+            playing = 1;
+            play_once = playerdata->play_once;
+          }
+
+        }
+      }
+    }
+
+
+    if(playing) {
+
+      if(f_eof(&file)) {
+        if(play_once) {
+          playing = 0;
+          content = 0;
+          chunksize = 0;
+          can_play = 0;
+          osMutexAcquire(gFSMutex, osWaitForever);
+          res = f_close(&file);
+          osMutexRelease(gFSMutex);
+          playerdata->enabled = 0;
+          playerdata->playing = 0;
+          continue;
+        } else {
+          content = 0;
+          chunksize = 0;
+          can_play = 0;
+          osMutexAcquire(gFSMutex, osWaitForever);
+          res = f_rewind(&file);
+          osMutexRelease(gFSMutex);
+          if(res != FR_OK) {
+
+          }
+          playerdata->playing = 0;
+        }
+      }
+
+      if(content < 512) {
+        toread = filebuffersize - content;
+        toread = toread - toread % 512;
+        if(toread > f_size(&file) - f_tell(&file))
+          toread = f_size(&file) - f_tell(&file);
+
+        for(int i = 0; i < content; i++) {
+          filebuffer[i] = filebuffer[toread + i];
+        }
+
+        while(toread > 0) {
+          osMutexAcquire(gFSMutex, osWaitForever);
+          res = f_read(&file, &filebuffer[content], toread, &read);
+          osMutexRelease(gFSMutex);
+
+          content += read;
+          toread -= read;
+
+          if(res != FR_OK) {
+            break;
+          }
+        }
+
+        if(res != FR_OK) {
+          restart = 1;
+          playerdata->fs_errors++;
+          continue;
+        }
+      }
+
+      output_samples = 0;
+      tempfilebuffer = &filebuffer[filebuffersize - content];
+
+      if(chunksize == 0) {
+        can_play = 0;
+        if(strncmp((char*)&tempfilebuffer[0], "RIFF", 4) == 0 && strncmp((char*)&tempfilebuffer[8], "WAVE", 4) == 0) {
+          tempfilebuffer += 12;
+          content -= 12;
+        } else {
+          if(content >= 8) {
+            memcpy(&chunksize, &tempfilebuffer[4], sizeof(uint32_t));
+            if(strncmp((char*)tempfilebuffer, "data", 4) == 0) {
+              tempfilebuffer += 8;
+              content -= 8;
+              can_play = 1;
+            } else {
+              if(content >= chunksize) {
+                if(strncmp((char*)tempfilebuffer, "fmt ", 4) == 0) {
+                  tempfilebuffer += 8;
+                  content -= 8;
+
+                  memcpy(&format, &tempfilebuffer[0], sizeof(uint16_t));
+                  memcpy(&channels, &tempfilebuffer[2], sizeof(uint16_t));
+                  memcpy(&samplerate, &tempfilebuffer[4], sizeof(uint32_t));
+                  memcpy(&blockalign, &tempfilebuffer[12], sizeof(uint16_t));
+                  memcpy(&bitpersample, &tempfilebuffer[14], sizeof(uint16_t));
+
+                  tempfilebuffer += chunksize;
+                  content -= chunksize;
+                  chunksize = 0;
+
+                  playerdata->channels = channels;
+                } else {
+                  tempfilebuffer += chunksize + 8;
+                  content -= chunksize + 8;
+                  chunksize = 0;
+                  //playerdata->wav_errors++;
+                }
+              } else {
+                playerdata->wav_errors++;
+              }
+            }
+          } else {
+            playerdata->wav_errors++;
+          }
+        }
+
+      }
+
+      if(can_play) {
+        bytes_needed = 512;
+        if(bytes_needed > chunksize) {
+          bytes_needed = chunksize;
+        }
+        if(bytes_needed > content) {
+          bytes_needed = content;
+        }
+
+        chunksize -= bytes_needed;
+
+        output_samples = bytes_needed / (bitpersample / 8);
+
+      }
+
+      playerdata->file_percentage = ((float)f_tell(&file) / (float)f_size(&file)) * 100.0f;
+
+      if(can_play && output_samples > 0 && channels > 0 && bitpersample == 16) {
+        while(getfree(playerdata->buffer_wr, playerdata->buffer_rd, playerdata->bufferSize) <= output_samples) {
+          osDelay(1);
+        }
+
+        if(channels == 2) {
+          for(int i = 0; i < output_samples;) {
+            bufferl[playerdata->buffer_wr] = (float)(((int16_t*)tempfilebuffer)[i++]) * volume;
+            bufferr[playerdata->buffer_wr] = (float)(((int16_t*)tempfilebuffer)[i++]) * volume;
+
+            if(playerdata->buffer_wr + 1 >= playerdata->bufferSize)
+              playerdata->buffer_wr = 0;
+            else playerdata->buffer_wr++;
+          }
+        } else if(channels == 1) {
+          for(int i = 0; i < output_samples;) {
+            bufferl[playerdata->buffer_wr] = (float)(((int16_t*)tempfilebuffer)[i++]) * volume;
+
+            if(playerdata->buffer_wr + 1 >= playerdata->bufferSize)
+              playerdata->buffer_wr = 0;
+            else playerdata->buffer_wr++;
+          }
+        }
+
+        playerdata->playing = 1;
+
+        taskENTER_CRITICAL();
+        if(HAL_GetTick() - gMp3LedLast > 1000) {
+          gMp3LedLast = HAL_GetTick();
+          HAL_GPIO_TogglePin(LED2_YELLOW_GPIO_Port, LED2_YELLOW_Pin);
+        }
+        taskEXIT_CRITICAL();
+      }
+
+      if(can_play) {
+        playerdata->playing = playing;
+        content -= bytes_needed;
+        tempfilebuffer += bytes_needed;
+
+      }
+
+    } else {
+      playerdata->playing = 0;
+      osDelay(10);
+    }
   }
 }
 
