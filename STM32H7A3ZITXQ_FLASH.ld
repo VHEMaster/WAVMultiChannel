@@ -52,7 +52,6 @@ MEMORY
   RAM_SRD (xrw)  : ORIGIN = 0x38000000, LENGTH = 32K
 }
 
-/* Define output sections */
 SECTIONS
 {
   /* The startup code goes first into FLASH */
@@ -170,6 +169,23 @@ SECTIONS
     libm.a ( * )
     libgcc.a ( * )
   }
-
+  
+  . = ALIGN(4);
+  .DtcmRam1 :
+  {
+    . = ALIGN(4);
+    *(.DtcmRam1*)
+    . = ALIGN(4);
+  } >DTCMRAM1
+  
+  . = ALIGN(4);
+  .DtcmRam2 :
+  {
+    . = ALIGN(4);
+    *(.DtcmRam2*)
+    . = ALIGN(4);
+  } >DTCMRAM2
+  
+  
   .ARM.attributes 0 : { *(.ARM.attributes) }
 }

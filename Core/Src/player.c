@@ -14,6 +14,8 @@
 #include <stdio.h>
 #include <limits.h>
 
+#define TICK_US (TIM5->CNT)
+
 osThreadId_t taskIdleHandle;
 
 const osThreadAttr_t taskIdle_attributes = {
@@ -74,30 +76,36 @@ extern UART_HandleTypeDef huart3;
 #define TDM_COUNT           (4)
 #define CHANNELS_COUNT      (64)
 #define PLAYERS_COUNT       (32)
+#define TDM_SAMPLES_COUNT   (32)
 #define CHANNELS_PER_TDM    (CHANNELS_COUNT / TDM_COUNT)
 #define SAMPLE_BUFFER_SIZE  (2048)
 #define FILE_BUFFER_SIZE    (16384)
 #define MAX_FILE_PATH       (128)
 #define TDM_TEMP_BUFFER_SIZE (TDM_BUFFER_SIZE / CHANNELS_PER_TDM)
 #define TDM_TEMP_HALF_BUFFER_SIZE (TDM_TEMP_BUFFER_SIZE / 2)
+#define TDM_BUFFER_SIZE (TDM_SAMPLES_COUNT * CHANNELS_PER_TDM)
 
-uint8_t gMixer[CHANNELS_COUNT][PLAYERS_COUNT];
+#define RAM_ALIGNED_32 __attribute__((aligned(32)))
+#define RAM_DTCM1 __attribute__((section(".DtcmRam1")))
+#define RAM_DTCM2 __attribute__((section(".DtcmRam2")))
 
-int16_t gSamplesBuffer[PLAYERS_COUNT][SAMPLE_BUFFER_SIZE];
-uint8_t gFileBuffer[PLAYERS_COUNT][FILE_BUFFER_SIZE];
-osMutexId_t gMp3Mutex;
-osMutexId_t gFSMutex;
-osThreadId_t gTaskIdle;
+static RAM_DTCM1 uint8_t gMixer[CHANNELS_COUNT][PLAYERS_COUNT];
+
+static int16_t gSamplesBufferL[PLAYERS_COUNT][SAMPLE_BUFFER_SIZE] = {{0}};
+static int16_t gSamplesBufferR[PLAYERS_COUNT][SAMPLE_BUFFER_SIZE] = {{0}};
+static uint8_t gFileBuffer[PLAYERS_COUNT][FILE_BUFFER_SIZE] = {{0}};
+static osMutexId_t gFSMutex;
 
 volatile float gCpuLoad = 0;
 volatile float gCpuLoadMax = 0;
 volatile uint32_t gIdleTick = 1000;
 volatile uint32_t gMp3LedLast = 0;
 
-#define TDM_BUFFER_SIZE (256 * CHANNELS_PER_TDM)
 static SAI_HandleTypeDef  *const gSai[TDM_COUNT] = { &hsai_BlockA1, &hsai_BlockB1, &hsai_BlockA2, &hsai_BlockB2 };
-static int16_t gTdmFinalBuffers[TDM_COUNT][TDM_BUFFER_SIZE] __attribute__((aligned(32)));
-static int16_t gTdmTempHalfBuffers[PLAYERS_COUNT][TDM_TEMP_HALF_BUFFER_SIZE];
+static RAM_ALIGNED_32 int16_t gTdmFinalBuffers[TDM_COUNT][TDM_BUFFER_SIZE] = {{0}};
+static RAM_DTCM1 int16_t gPlayersTempBuffer[PLAYERS_COUNT][TDM_SAMPLES_COUNT] = {{0}};
+static RAM_DTCM1 int32_t gChannelSamples[TDM_SAMPLES_COUNT] = {0};
+static RAM_DTCM1 int8_t gPlayersAvailable[PLAYERS_COUNT] = {0};
 
 typedef struct {
     uint32_t index;
@@ -107,11 +115,13 @@ typedef struct {
     volatile uint8_t playing;
     volatile uint8_t play_once;
     volatile uint8_t changed;
+    volatile uint8_t channels;
     uint8_t volume;
     osThreadId_t task;
     osMutexId_t mutex;
     uint32_t bufferSize;
-    int16_t *buffer;
+    int16_t *bufferl;
+    int16_t *bufferr;
     uint8_t *fileBuffer;
     uint32_t fileBufferSize;
     uint32_t buffer_rd;
@@ -119,6 +129,10 @@ typedef struct {
     uint32_t underflow_rd;
     uint32_t fs_errors;
     float file_percentage;
+    uint32_t samplerate;
+    uint32_t bytespersample;
+    uint32_t startpos;
+    uint32_t endpos;
 }sPlayerData;
 
 typedef struct {
@@ -164,15 +178,76 @@ static inline uint32_t getfree(uint32_t wr, uint32_t rd, uint32_t size) {
   return size - getavail(wr, rd, size);
 }
 
-static void HandleSaiDma(int sai_index, int16_t *buffer, uint32_t size)
+static void HandleSaiDma(int16_t *buffer[TDM_COUNT], uint32_t size)
 {
   uint32_t samples_per_channel = size / CHANNELS_PER_TDM;
-  int buffer_index;
-  int channel_index;
-  int32_t value;
-  int16_t data;
-  int available[PLAYERS_COUNT] = {0};
+  uint32_t channel;
+  int32_t sample;
+  int32_t mono;
+  int16_t *samples;
 
+  memset(gPlayersAvailable, 0, sizeof(gPlayersAvailable));
+
+  for(int tdm = 0; tdm < TDM_COUNT; tdm++) {
+    for(int lch = 0; lch < CHANNELS_PER_TDM; lch++) {
+      channel = tdm * CHANNELS_PER_TDM + lch;
+
+      for(int player = 0; player < PLAYERS_COUNT; player++) {
+        if(gMixer[channel][player]) {
+          if(gPlayersAvailable[player] == 0) {
+            gPlayersAvailable[player] = getavail(gPlayersData.player[player].buffer_wr, gPlayersData.player[player].buffer_rd, gPlayersData.player[player].bufferSize) >= samples_per_channel ? 1 : -1;
+            if(gPlayersAvailable[player] == -1) {
+              if(gPlayersData.player[player].playing) {
+                gPlayersData.player[player].underflow_rd++;
+              }
+            }
+          }
+          if(gPlayersAvailable[player] > 0) {
+            if(gPlayersAvailable[player] == 1) {
+              gPlayersAvailable[player] = 2;
+              if(gPlayersData.player[player].channels == 1) {
+                samples = gPlayersData.player[player].bufferl;
+              } else if(gPlayersData.player[player].channels == 2) {
+                samples = (gMixer[channel][player] == 2) ?
+                    gPlayersData.player[player].bufferl : gMixer[channel][player] == 3 ?
+                        gPlayersData.player[player].bufferr : NULL;
+              }
+              for(int i = 0; i < samples_per_channel; i++) {
+                if(samples) {
+                  gPlayersTempBuffer[player][i] = samples[gPlayersData.player[player].buffer_rd];
+                } else {
+                  mono = gPlayersData.player[player].bufferl[gPlayersData.player[player].buffer_rd];
+                  mono += gPlayersData.player[player].bufferr[gPlayersData.player[player].buffer_rd];
+                  mono >>= 1;
+                  gPlayersTempBuffer[player][i] = mono;
+                }
+                if(gPlayersData.player[player].buffer_rd + 1 >= gPlayersData.player[player].bufferSize)
+                  gPlayersData.player[player].buffer_rd = 0;
+                else gPlayersData.player[player].buffer_rd++;
+                gChannelSamples[i] += gPlayersTempBuffer[player][i];
+              }
+            } else if(gPlayersAvailable[player] == 2) {
+              for(int i = 0; i < samples_per_channel; i++) {
+                gChannelSamples[i] += gPlayersTempBuffer[player][i];
+              }
+            }
+          }
+        }
+      }
+      for(int i = 0; i < samples_per_channel; i++) {
+        sample = gChannelSamples[i];
+        if(sample > SHRT_MAX) sample = SHRT_MAX;
+        else if(sample < SHRT_MIN) sample = SHRT_MIN;
+        buffer[tdm][i * CHANNELS_PER_TDM + lch] = sample;
+        gChannelSamples[i] = 0;
+      }
+
+
+    }
+    SCB_CleanDCache_by_Addr((uint32_t *)buffer[tdm], size * sizeof(*buffer[tdm]));
+  }
+
+  /*
   for(int j = 0; j < samples_per_channel; j++)
   {
     for(int i = 0; i < CHANNELS_PER_TDM; i++)
@@ -183,25 +258,25 @@ static void HandleSaiDma(int sai_index, int16_t *buffer, uint32_t size)
 
       for(int player = 0; player < PLAYERS_COUNT; player++) {
         if(gMixer[channel_index][player]) {
-          if(!available[player]) {
-            available[player] = getavail(gPlayersData.player[player].buffer_wr, gPlayersData.player[player].buffer_rd, gPlayersData.player[player].bufferSize) >= samples_per_channel ? 1 : -1;
-            if(available[player] == -1) {
+          if(gAvailable[player] == 0) {
+            gAvailable[player] = getavail(gPlayersData.player[player].buffer_wr, gPlayersData.player[player].buffer_rd, gPlayersData.player[player].bufferSize) >= samples_per_channel ? 1 : -1;
+            if(gAvailable[player] == -1) {
               if(gPlayersData.player[player].playing) {
                 gPlayersData.player[player].underflow_rd++;
               }
             }
           }
-          if(available[player] > 0) {
+          if(gAvailable[player] > 0) {
             data = 0;
-            if(available[player] == 1) {
+            if(gAvailable[player] == 1) {
               data = gPlayersData.player[player].buffer[gPlayersData.player[player].buffer_rd];
               if(gPlayersData.player[player].buffer_rd + 1 >= gPlayersData.player[player].bufferSize)
                 gPlayersData.player[player].buffer_rd = 0;
               else gPlayersData.player[player].buffer_rd++;
 
               gTdmTempHalfBuffers[player][j] = data;
-              available[player] = 2;
-            } else if(available[player] == 2) {
+              gAvailable[player] = 2;
+            } else if(gAvailable[player] == 2) {
               data = gTdmTempHalfBuffers[player][j];
             }
 
@@ -214,26 +289,27 @@ static void HandleSaiDma(int sai_index, int16_t *buffer, uint32_t size)
 
     }
   }
-
-  SCB_CleanDCache_by_Addr((uint32_t *)buffer, size * sizeof(*buffer));
+  */
 }
 
 void HAL_SAI_TxCpltCallback(SAI_HandleTypeDef *hsai)
 {
-  for(int i = 0; i < TDM_COUNT; i++) {
-    if(gSai[i] == hsai) {
-      HandleSaiDma(i, &gTdmFinalBuffers[i][TDM_BUFFER_SIZE / 2], TDM_BUFFER_SIZE / 2);
-    }
-  }
+  int16_t *buffers[TDM_COUNT];
+  for(int i = 0; i < TDM_COUNT; i++)
+    buffers[i] = &gTdmFinalBuffers[i][TDM_BUFFER_SIZE / 2];
+
+  if(gSai[0] == hsai)
+    HandleSaiDma(buffers, TDM_BUFFER_SIZE / 2);
 }
 
 void HAL_SAI_TxHalfCpltCallback(SAI_HandleTypeDef *hsai)
 {
-  for(int i = 0; i < TDM_COUNT; i++) {
-    if(gSai[i] == hsai) {
-      HandleSaiDma(i, &gTdmFinalBuffers[i][0], TDM_BUFFER_SIZE / 2);
-    }
-  }
+  int16_t *buffers[TDM_COUNT];
+  for(int i = 0; i < TDM_COUNT; i++)
+    buffers[i] = &gTdmFinalBuffers[i][0];
+
+  if(gSai[0] == hsai)
+    HandleSaiDma(buffers, TDM_BUFFER_SIZE / 2);
 }
 
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
@@ -315,18 +391,18 @@ void player_tick(void)
 
 void player_start(void)
 {
-  uint64_t time = 0;
   sSdStats sdstats;
   sPlayersData *playersdata = &gPlayersData;
   char *str = NULL;
   char *args = NULL;
   uint32_t channel;
   uint32_t enabled;
+  uint32_t mixer;
   uint32_t play_once;
   uint32_t len = 0;
   uint32_t arg;
-  uint32_t tick;
-  uint32_t current;
+  uint32_t ms;
+  uint32_t tms;
   uint32_t arg_start, arg_end;
   const float msr_koff = 0.0166667f;
   float sd_avg = 0;
@@ -346,6 +422,14 @@ void player_start(void)
   HAL_GPIO_WritePin(LED2_YELLOW_GPIO_Port, LED2_YELLOW_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(LED3_RED_GPIO_Port, LED3_RED_Pin, GPIO_PIN_RESET);
 
+  for(int i = 0; i < TDM_COUNT; i++)
+    HAL_SAI_TxHalfCpltCallback(gSai[i]);
+  for(int i = 0; i < TDM_COUNT; i++)
+    HAL_SAI_TxHalfCpltCallback(gSai[i]);
+  for(int i = 1; i < TDM_COUNT; i++)
+    HAL_SAI_Transmit_DMA(gSai[i], (uint8_t *)gTdmFinalBuffers[i], TDM_BUFFER_SIZE);
+  if(TDM_COUNT > 0)
+    HAL_SAI_Transmit_DMA(gSai[0], (uint8_t *)gTdmFinalBuffers[0], TDM_BUFFER_SIZE);
 
   memset(&gCommData, 0, sizeof(gCommData));
   gCommData.huart = &huart3;
@@ -374,23 +458,18 @@ void player_start(void)
     playersdata->player[i].volume = 100;
 
     playersdata->player[i].bufferSize = SAMPLE_BUFFER_SIZE;
-    playersdata->player[i].buffer = gSamplesBuffer[i];
+    playersdata->player[i].bufferl = gSamplesBufferL[i];
+    playersdata->player[i].bufferr = gSamplesBufferR[i];
     playersdata->player[i].fileBufferSize = FILE_BUFFER_SIZE;
     playersdata->player[i].fileBuffer = gFileBuffer[i];
 
     playersdata->player[i].task = osThreadNew(StartPlayerTask, &playersdata->player[i], &taskPlayer_attributes);
   }
 
-  for(int i = 0; i < TDM_COUNT; i++) {
-    HandleSaiDma(i, gTdmFinalBuffers[i], TDM_BUFFER_SIZE);
-    HAL_SAI_Transmit_DMA(gSai[i], (uint8_t *)gTdmFinalBuffers[i], TDM_BUFFER_SIZE);
-  }
-
   taskIdleHandle = osThreadNew(StartIdleTask, NULL, &taskIdle_attributes);
   HAL_TIM_Base_Start_IT(&htim5);
 
-  current = xTaskGetTickCount();
-  tick = 0;
+  ms = HAL_GetTick();
 
   for(;;)
   {
@@ -426,10 +505,12 @@ void player_start(void)
               Comm_Transmit(&gCommData, "OK");
             } else if(strcmp(str, "mixer") == 0) {
               osMutexAcquire(gPlayersData.player[i].mutex, osWaitForever);
-              if(sscanf(args, "%lu,%lu", &channel, &enabled) == 2) {
+              if(sscanf(args, "%lu,%lu,%lu", &channel, &mixer, &enabled) == 2) {
                 channel -= 1;
-                if(channel < CHANNELS_COUNT && (enabled == 1 || enabled == 0)) {
-                  gMixer[channel][i] = enabled;
+                if(channel < CHANNELS_COUNT &&
+                   (enabled == 1 || enabled == 0) &&
+                   (mixer == 0 || mixer == 1 || mixer == 2)) {
+                  gMixer[channel][i] = (enabled) ? (mixer + 1) : (0);
                   Comm_Transmit(&gCommData, "OK");
                 }
               }
@@ -461,131 +542,73 @@ void player_start(void)
     }
 
     taskENTER_CRITICAL();
-    if(xTaskGetTickCount() - gMp3LedLast > 1000) {
-      gMp3LedLast = xTaskGetTickCount();
+    if(HAL_GetTick() - gMp3LedLast > 1000) {
+      gMp3LedLast = HAL_GetTick();
       HAL_GPIO_WritePin(LED2_YELLOW_GPIO_Port, LED2_YELLOW_Pin, GPIO_PIN_RESET);
     }
     taskEXIT_CRITICAL();
 
-    current += 30;
-    osDelayUntil(current);
-    if(++tick >= 1000/30) {
-      tick = 0;
-      time++;
+    osDelay(1);
 
-      sdstats = BSP_SD_GetStats();
+    tms = HAL_GetTick();
 
-      if(gIdleTick > 1000)
-        gIdleTick = 1000;
+    if(ms != tms) {
+      ms++;
 
-      gCpuLoad = (float)(1000 - gIdleTick) * 0.1f;
-      gIdleTick = 0;
+      if(ms % 1000 == 0) {
 
-      if(gCpuLoadMax < gCpuLoad)
-        gCpuLoadMax = gCpuLoad;
+        sdstats = BSP_SD_GetStats();
 
-      if(cpu_avg == 0.0f)
-        cpu_avg = gCpuLoad;
-      else cpu_avg = cpu_avg * (1.0f - msr_koff) + gCpuLoad * msr_koff;
+        if(gIdleTick > 1000)
+          gIdleTick = 1000;
 
-      if(sd_avg == 0.0f)
-        sd_avg = sdstats.readLast;
-      else sd_avg = sd_avg * (1.0f - msr_koff) + sdstats.readLast * msr_koff;
+        gCpuLoad = (float)(1000 - gIdleTick) * 0.1f;
+        gIdleTick = 0;
 
-      if(ram_avg == 0.0f)
-        ram_avg =  xPortGetFreeHeapSize();
-      else ram_avg = ram_avg * (1.0f - msr_koff) + xPortGetFreeHeapSize() * msr_koff;
+        if(gCpuLoadMax < gCpuLoad)
+          gCpuLoadMax = gCpuLoad;
 
-      Comm_Transmit(&gCommData, "SD: %.1fKB/s Max: %.1fKB/s Avg: %.1fKB/s\r\n"
-          "CPU: %.1f%% Max: %.1f%% Avg: %.1f%%\r\n"
-          "RAM: %.2fKB Min: %.1fKB Avg: %.2fKB",
+        if(cpu_avg == 0.0f)
+          cpu_avg = gCpuLoad;
+        else cpu_avg = cpu_avg * (1.0f - msr_koff) + gCpuLoad * msr_koff;
 
-          (float)sdstats.readLast / 1024.0f,
-          (float)sdstats.readMax / 1024.0f,
-          sd_avg / 1024.0f,
+        if(sd_avg == 0.0f)
+          sd_avg = sdstats.readLast;
+        else sd_avg = sd_avg * (1.0f - msr_koff) + sdstats.readLast * msr_koff;
 
-          gCpuLoad,
-          gCpuLoadMax,
-          cpu_avg,
+        if(ram_avg == 0.0f)
+          ram_avg =  xPortGetFreeHeapSize();
+        else ram_avg = ram_avg * (1.0f - msr_koff) + xPortGetFreeHeapSize() * msr_koff;
 
-          (float)xPortGetFreeHeapSize() / 1024.0f,
-          (float)xPortGetMinimumEverFreeHeapSize() / 1024.0f,
-          ram_avg / 1024.0f);
+        Comm_Transmit(&gCommData, "SD: %.1fKB/s Max: %.1fKB/s Avg: %.1fKB/s\r\n"
+            "CPU: %.1f%% Max: %.1f%% Avg: %.1f%%\r\n"
+            "RAM: %.2fKB Min: %.1fKB Avg: %.2fKB",
 
+            (float)sdstats.readLast / 1024.0f,
+            (float)sdstats.readMax / 1024.0f,
+            sd_avg / 1024.0f,
+
+            gCpuLoad,
+            gCpuLoadMax,
+            cpu_avg,
+
+            (float)xPortGetFreeHeapSize() / 1024.0f,
+            (float)xPortGetMinimumEverFreeHeapSize() / 1024.0f,
+            ram_avg / 1024.0f);
+      }
     }
   }
 }
 
-static volatile uint32_t gOpened = 0;
-static volatile uint32_t gWriten = 0;
-static volatile uint32_t times[PLAYERS_COUNT];
-static volatile float speeds[PLAYERS_COUNT];
 
 void StartPlayerTask(void *args)
 {
   sPlayerData *playerdata = (sPlayerData *)args;
   FRESULT res;
   FIL file;
-  uint32_t size;
-  uint32_t block;
-  uint32_t left;
-  uint32_t time;
-  UINT read = 0;
-
-
-  osMutexAcquire(gFSMutex, osWaitForever);
-  res = f_open(&file, playerdata->file, FA_READ);
-  osMutexRelease(gFSMutex);
-  if(res != FR_OK) {
-    vTaskSuspendAll();
-    while(1) {
-      HAL_Delay(500);
-      HAL_GPIO_TogglePin(LED3_RED_GPIO_Port, LED3_RED_Pin);
-    }
-  }
-
-  taskENTER_CRITICAL();
-  gOpened++;
-  taskEXIT_CRITICAL();
-
-  time = xTaskGetTickCount();
-
-  size = f_size(&file);
-  left = size;
 
   while(1) {
-    time = xTaskGetTickCount();
-    gMp3LedLast = time;
 
-    block = left;
-    if(block > playerdata->fileBufferSize)
-      block = playerdata->fileBufferSize;
-
-    osMutexAcquire(gFSMutex, osWaitForever);
-    res = f_read(&file, playerdata->fileBuffer, block, &read);
-    osMutexRelease(gFSMutex);
-
-    if(res != FR_OK) {
-      vTaskSuspendAll();
-      while(1) {
-        HAL_Delay(500);
-        HAL_GPIO_TogglePin(LED3_RED_GPIO_Port, LED3_RED_Pin);
-      }
-    }
-
-    left -= block;
-    if(!left) {
-      osMutexAcquire(gFSMutex, osWaitForever);
-      res = f_rewind(&file);
-      osMutexRelease(gFSMutex);
-
-      left = size;
-
-      times[playerdata->index] = xTaskGetTickCount() - time;
-      speeds[playerdata->index] = ((float)size / ((float)times[playerdata->index] / 1000.0f)) / 1024.0f / 1024.0f;
-      if(playerdata->index == 0)
-        HAL_GPIO_TogglePin(LED2_YELLOW_GPIO_Port, LED2_YELLOW_Pin);
-    }
     //osDelay(1);
   }
 }

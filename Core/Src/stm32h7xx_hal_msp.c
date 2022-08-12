@@ -142,7 +142,7 @@ void HAL_SD_MspInit(SD_HandleTypeDef* hsd)
     HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
     /* SDMMC1 interrupt Init */
-    HAL_NVIC_SetPriority(SDMMC1_IRQn, 5, 0);
+    HAL_NVIC_SetPriority(SDMMC1_IRQn, 7, 0);
     HAL_NVIC_EnableIRQ(SDMMC1_IRQn);
   /* USER CODE BEGIN SDMMC1_MspInit 1 */
 
@@ -311,7 +311,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef* huart)
     __HAL_LINKDMA(huart,hdmatx,hdma_usart3_tx);
 
     /* USART3 interrupt Init */
-    HAL_NVIC_SetPriority(USART3_IRQn, 5, 0);
+    HAL_NVIC_SetPriority(USART3_IRQn, 13, 0);
     HAL_NVIC_EnableIRQ(USART3_IRQn);
   /* USER CODE BEGIN USART3_MspInit 1 */
 
@@ -379,7 +379,7 @@ void HAL_SAI_MspInit(SAI_HandleTypeDef* hsai)
        __HAL_RCC_SAI1_CLK_ENABLE();
 
     /* Peripheral interrupt init*/
-    HAL_NVIC_SetPriority(SAI1_IRQn, 5, 0);
+    HAL_NVIC_SetPriority(SAI1_IRQn, 12, 0);
     HAL_NVIC_EnableIRQ(SAI1_IRQn);
     }
     SAI1_client ++;
@@ -432,7 +432,7 @@ void HAL_SAI_MspInit(SAI_HandleTypeDef* hsai)
        __HAL_RCC_SAI1_CLK_ENABLE();
 
       /* Peripheral interrupt init*/
-      HAL_NVIC_SetPriority(SAI1_IRQn, 5, 0);
+      HAL_NVIC_SetPriority(SAI1_IRQn, 12, 0);
       HAL_NVIC_EnableIRQ(SAI1_IRQn);
       }
     SAI1_client ++;
@@ -481,7 +481,7 @@ void HAL_SAI_MspInit(SAI_HandleTypeDef* hsai)
        __HAL_RCC_SAI2_CLK_ENABLE();
 
     /* Peripheral interrupt init*/
-    HAL_NVIC_SetPriority(SAI2_IRQn, 5, 0);
+    HAL_NVIC_SetPriority(SAI2_IRQn, 12, 0);
     HAL_NVIC_EnableIRQ(SAI2_IRQn);
     }
     SAI2_client ++;
@@ -531,7 +531,7 @@ void HAL_SAI_MspInit(SAI_HandleTypeDef* hsai)
        __HAL_RCC_SAI2_CLK_ENABLE();
 
       /* Peripheral interrupt init*/
-      HAL_NVIC_SetPriority(SAI2_IRQn, 5, 0);
+      HAL_NVIC_SetPriority(SAI2_IRQn, 12, 0);
       HAL_NVIC_EnableIRQ(SAI2_IRQn);
       }
     SAI2_client ++;
