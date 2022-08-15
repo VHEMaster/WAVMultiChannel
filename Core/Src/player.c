@@ -615,9 +615,7 @@ void StartPlayerTask(void *arg)
   uint8_t can_play = 0;
   uint32_t bytes_needed = 0;
 
-  playing = 0;
-
-  while(1)
+  void AcquireExternalParameters(void)
   {
     filebuffer = playerdata->fileBuffer;
     filebuffersize = playerdata->fileBufferSize;
@@ -668,172 +666,212 @@ void StartPlayerTask(void *arg)
         }
       }
     }
+  }
+
+  int CheckIsEof(void)
+  {
+    if(f_eof(&file)) {
+      if(play_once) {
+        playing = 0;
+        content = 0;
+        chunksize = 0;
+        can_play = 0;
+        osMutexAcquire(gFSMutex, osWaitForever);
+        res = f_close(&file);
+        osMutexRelease(gFSMutex);
+        playerdata->enabled = 0;
+        playerdata->playing = 0;
+        return 1;
+      } else {
+        content = 0;
+        chunksize = 0;
+        can_play = 0;
+        osMutexAcquire(gFSMutex, osWaitForever);
+        res = f_rewind(&file);
+        osMutexRelease(gFSMutex);
+        if(res != FR_OK) {
+
+        }
+        playerdata->playing = 0;
+      }
+    }
+
+    return 0;
+  }
+
+  int ReadFile(void)
+  {
+    if(content < 512) {
+      toread = filebuffersize - content;
+      toread = toread - toread % 512;
+      if(toread > f_size(&file) - f_tell(&file))
+        toread = f_size(&file) - f_tell(&file);
+
+      for(int i = 0; i < content; i++) {
+        filebuffer[i] = filebuffer[toread + i];
+      }
+
+      while(toread > 0) {
+        osMutexAcquire(gFSMutex, osWaitForever);
+        res = f_read(&file, &filebuffer[content], toread, &read);
+        osMutexRelease(gFSMutex);
+
+        content += read;
+        toread -= read;
+
+        if(res != FR_OK) {
+          restart = 1;
+          break;
+        }
+      }
+
+      if(res != FR_OK) {
+        restart = 1;
+        playerdata->fs_errors++;
+        return 1;
+      }
+    }
+    return 0;
+  }
+
+  void HandleFileHeader(void)
+  {
+    output_samples = 0;
+    tempfilebuffer = &filebuffer[filebuffersize - content];
+
+    if(chunksize == 0) {
+      can_play = 0;
+      if(strncmp((char*)&tempfilebuffer[0], "RIFF", 4) == 0 && strncmp((char*)&tempfilebuffer[8], "WAVE", 4) == 0) {
+        tempfilebuffer += 12;
+        content -= 12;
+      } else {
+        if(content >= 8) {
+          memcpy(&chunksize, &tempfilebuffer[4], sizeof(uint32_t));
+          if(strncmp((char*)tempfilebuffer, "data", 4) == 0) {
+            tempfilebuffer += 8;
+            content -= 8;
+            can_play = 1;
+          } else {
+            if(content >= chunksize) {
+              if(strncmp((char*)tempfilebuffer, "fmt ", 4) == 0) {
+                tempfilebuffer += 8;
+                content -= 8;
+
+                memcpy(&format, &tempfilebuffer[0], sizeof(uint16_t));
+                memcpy(&channels, &tempfilebuffer[2], sizeof(uint16_t));
+                memcpy(&samplerate, &tempfilebuffer[4], sizeof(uint32_t));
+                memcpy(&blockalign, &tempfilebuffer[12], sizeof(uint16_t));
+                memcpy(&bitpersample, &tempfilebuffer[14], sizeof(uint16_t));
+
+                tempfilebuffer += chunksize;
+                content -= chunksize;
+                chunksize = 0;
+
+                playerdata->channels = channels;
+              } else {
+                tempfilebuffer += chunksize + 8;
+                content -= chunksize + 8;
+                chunksize = 0;
+                //playerdata->wav_errors++;
+              }
+            } else {
+              playerdata->wav_errors++;
+            }
+          }
+        } else {
+          playerdata->wav_errors++;
+        }
+      }
+    }
+  }
+
+  void PreCycleHandler(void)
+  {
+    if(can_play) {
+      bytes_needed = 512;
+      if(bytes_needed > chunksize) {
+        bytes_needed = chunksize;
+      }
+      if(bytes_needed > content) {
+        bytes_needed = content;
+      }
+
+      chunksize -= bytes_needed;
+
+      output_samples = bytes_needed / (bitpersample / 8);
+
+    }
+
+    playerdata->file_percentage = ((float)f_tell(&file) / (float)f_size(&file)) * 100.0f;
+  }
+
+  void HandleSamples(void)
+  {
+    if(can_play && output_samples > 0 && channels > 0 && bitpersample == 16) {
+      while(getfree(playerdata->buffer_wr, playerdata->buffer_rd, playerdata->bufferSize) <= output_samples) {
+        osDelay(1);
+      }
+
+      if(channels == 2) {
+        for(int i = 0; i < output_samples;) {
+          bufferl[playerdata->buffer_wr] = (float)(((int16_t*)tempfilebuffer)[i++]) * volume;
+          bufferr[playerdata->buffer_wr] = (float)(((int16_t*)tempfilebuffer)[i++]) * volume;
+
+          if(playerdata->buffer_wr + 1 >= playerdata->bufferSize)
+            playerdata->buffer_wr = 0;
+          else playerdata->buffer_wr++;
+        }
+      } else if(channels == 1) {
+        for(int i = 0; i < output_samples;) {
+          bufferl[playerdata->buffer_wr] = (float)(((int16_t*)tempfilebuffer)[i++]) * volume;
+
+          if(playerdata->buffer_wr + 1 >= playerdata->bufferSize)
+            playerdata->buffer_wr = 0;
+          else playerdata->buffer_wr++;
+        }
+      }
+
+      playerdata->playing = 1;
+
+      taskENTER_CRITICAL();
+      if(HAL_GetTick() - gMp3LedLast > 1000) {
+        gMp3LedLast = HAL_GetTick();
+        HAL_GPIO_TogglePin(LED2_YELLOW_GPIO_Port, LED2_YELLOW_Pin);
+      }
+      taskEXIT_CRITICAL();
+    }
+  }
+
+  void PostCycleHandler(void)
+  {
+    if(can_play) {
+      playerdata->playing = playing;
+      content -= bytes_needed;
+      tempfilebuffer += bytes_needed;
+    }
+  }
+
+  while(1)
+  {
+
+    AcquireExternalParameters();
 
 
     if(playing) {
 
-      if(f_eof(&file)) {
-        if(play_once) {
-          playing = 0;
-          content = 0;
-          chunksize = 0;
-          can_play = 0;
-          osMutexAcquire(gFSMutex, osWaitForever);
-          res = f_close(&file);
-          osMutexRelease(gFSMutex);
-          playerdata->enabled = 0;
-          playerdata->playing = 0;
-          continue;
-        } else {
-          content = 0;
-          chunksize = 0;
-          can_play = 0;
-          osMutexAcquire(gFSMutex, osWaitForever);
-          res = f_rewind(&file);
-          osMutexRelease(gFSMutex);
-          if(res != FR_OK) {
+      if(CheckIsEof())
+        continue;
 
-          }
-          playerdata->playing = 0;
-        }
-      }
+      if(ReadFile())
+        continue;
 
-      if(content < 512) {
-        toread = filebuffersize - content;
-        toread = toread - toread % 512;
-        if(toread > f_size(&file) - f_tell(&file))
-          toread = f_size(&file) - f_tell(&file);
+      HandleFileHeader();
 
-        for(int i = 0; i < content; i++) {
-          filebuffer[i] = filebuffer[toread + i];
-        }
+      PreCycleHandler();
 
-        while(toread > 0) {
-          osMutexAcquire(gFSMutex, osWaitForever);
-          res = f_read(&file, &filebuffer[content], toread, &read);
-          osMutexRelease(gFSMutex);
+      HandleSamples();
 
-          content += read;
-          toread -= read;
-
-          if(res != FR_OK) {
-            break;
-          }
-        }
-
-        if(res != FR_OK) {
-          restart = 1;
-          playerdata->fs_errors++;
-          continue;
-        }
-      }
-
-      output_samples = 0;
-      tempfilebuffer = &filebuffer[filebuffersize - content];
-
-      if(chunksize == 0) {
-        can_play = 0;
-        if(strncmp((char*)&tempfilebuffer[0], "RIFF", 4) == 0 && strncmp((char*)&tempfilebuffer[8], "WAVE", 4) == 0) {
-          tempfilebuffer += 12;
-          content -= 12;
-        } else {
-          if(content >= 8) {
-            memcpy(&chunksize, &tempfilebuffer[4], sizeof(uint32_t));
-            if(strncmp((char*)tempfilebuffer, "data", 4) == 0) {
-              tempfilebuffer += 8;
-              content -= 8;
-              can_play = 1;
-            } else {
-              if(content >= chunksize) {
-                if(strncmp((char*)tempfilebuffer, "fmt ", 4) == 0) {
-                  tempfilebuffer += 8;
-                  content -= 8;
-
-                  memcpy(&format, &tempfilebuffer[0], sizeof(uint16_t));
-                  memcpy(&channels, &tempfilebuffer[2], sizeof(uint16_t));
-                  memcpy(&samplerate, &tempfilebuffer[4], sizeof(uint32_t));
-                  memcpy(&blockalign, &tempfilebuffer[12], sizeof(uint16_t));
-                  memcpy(&bitpersample, &tempfilebuffer[14], sizeof(uint16_t));
-
-                  tempfilebuffer += chunksize;
-                  content -= chunksize;
-                  chunksize = 0;
-
-                  playerdata->channels = channels;
-                } else {
-                  tempfilebuffer += chunksize + 8;
-                  content -= chunksize + 8;
-                  chunksize = 0;
-                  //playerdata->wav_errors++;
-                }
-              } else {
-                playerdata->wav_errors++;
-              }
-            }
-          } else {
-            playerdata->wav_errors++;
-          }
-        }
-
-      }
-
-      if(can_play) {
-        bytes_needed = 512;
-        if(bytes_needed > chunksize) {
-          bytes_needed = chunksize;
-        }
-        if(bytes_needed > content) {
-          bytes_needed = content;
-        }
-
-        chunksize -= bytes_needed;
-
-        output_samples = bytes_needed / (bitpersample / 8);
-
-      }
-
-      playerdata->file_percentage = ((float)f_tell(&file) / (float)f_size(&file)) * 100.0f;
-
-      if(can_play && output_samples > 0 && channels > 0 && bitpersample == 16) {
-        while(getfree(playerdata->buffer_wr, playerdata->buffer_rd, playerdata->bufferSize) <= output_samples) {
-          osDelay(1);
-        }
-
-        if(channels == 2) {
-          for(int i = 0; i < output_samples;) {
-            bufferl[playerdata->buffer_wr] = (float)(((int16_t*)tempfilebuffer)[i++]) * volume;
-            bufferr[playerdata->buffer_wr] = (float)(((int16_t*)tempfilebuffer)[i++]) * volume;
-
-            if(playerdata->buffer_wr + 1 >= playerdata->bufferSize)
-              playerdata->buffer_wr = 0;
-            else playerdata->buffer_wr++;
-          }
-        } else if(channels == 1) {
-          for(int i = 0; i < output_samples;) {
-            bufferl[playerdata->buffer_wr] = (float)(((int16_t*)tempfilebuffer)[i++]) * volume;
-
-            if(playerdata->buffer_wr + 1 >= playerdata->bufferSize)
-              playerdata->buffer_wr = 0;
-            else playerdata->buffer_wr++;
-          }
-        }
-
-        playerdata->playing = 1;
-
-        taskENTER_CRITICAL();
-        if(HAL_GetTick() - gMp3LedLast > 1000) {
-          gMp3LedLast = HAL_GetTick();
-          HAL_GPIO_TogglePin(LED2_YELLOW_GPIO_Port, LED2_YELLOW_Pin);
-        }
-        taskEXIT_CRITICAL();
-      }
-
-      if(can_play) {
-        playerdata->playing = playing;
-        content -= bytes_needed;
-        tempfilebuffer += bytes_needed;
-
-      }
+      PostCycleHandler();
 
     } else {
       playerdata->playing = 0;
