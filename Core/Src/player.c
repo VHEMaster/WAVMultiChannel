@@ -90,6 +90,7 @@ extern UART_HandleTypeDef huart3;
 #define RAM_DTCM2 __attribute__((section(".DtcmRam2")))
 
 static RAM_DTCM1 uint8_t gMixer[CHANNELS_COUNT][PLAYERS_COUNT];
+static RAM_DTCM1 float gVolumes[CHANNELS_COUNT][PLAYERS_COUNT];
 
 static int16_t gSamplesBufferL[PLAYERS_COUNT][SAMPLE_BUFFER_SIZE] = {{0}};
 static int16_t gSamplesBufferR[PLAYERS_COUNT][SAMPLE_BUFFER_SIZE] = {{0}};
@@ -230,23 +231,23 @@ static void HandleSaiDma(int16_t *buffer[TDM_COUNT], uint32_t size)
                 else gPlayersData.player[player].buffer_rd++;
 
                 if(samples) {
-                  gChannelSamples[i] += samples[i];
+                  gChannelSamples[i] += (float)samples[i] * gVolumes[channel][player];
                 } else {
                   mono = gPlayersTempBufferL[player][i];
                   mono += gPlayersTempBufferR[player][i];
                   mono /= 2;
-                  gChannelSamples[i] += mono;
+                  gChannelSamples[i] += (float)mono * gVolumes[channel][player];
                 }
               }
             } else if(gPlayersAvailable[player] == 2) {
               for(int i = 0; i < samples_per_channel; i++) {
                 if(samples) {
-                  gChannelSamples[i] += samples[i];
+                  gChannelSamples[i] += (float)samples[i] * gVolumes[channel][player];
                 } else {
                   mono = gPlayersTempBufferL[player][i];
                   mono += gPlayersTempBufferR[player][i];
                   mono /= 2;
-                  gChannelSamples[i] += mono;
+                  gChannelSamples[i] += (float)mono * gVolumes[channel][player];
                 }
               }
             }
@@ -418,6 +419,9 @@ void player_start(void)
 
   memset(gTdmFinalBuffers, 0, sizeof(gTdmFinalBuffers));
   memset(gMixer, 0, sizeof(gMixer));
+  for(int i = 0; i < CHANNELS_COUNT; i++)
+    for(int j = 0; j < PLAYERS_COUNT; j++)
+      gVolumes[i][j] = 1.0f;
 
   gFSMutex = osMutexNew(&mutexFS_attributes);
   for(int i = 0; i < PLAYERS_COUNT; i++) {
@@ -485,12 +489,14 @@ void player_start(void)
               Comm_Transmit(&gCommData, "OK");
             } else if(strcmp(str, "mixer") == 0) {
               osMutexAcquire(gPlayersData.player[i].mutex, osWaitForever);
-              if(sscanf(args, "%lu,%lu,%lu", &channel, &mixer, &enabled) == 3) {
+              if(sscanf(args, "%lu,%lu,%lu,%ld", &channel, &mixer, &enabled, &arg) == 4) {
                 channel -= 1;
                 if(channel < CHANNELS_COUNT &&
                    (enabled == 1 || enabled == 0) &&
-                   (mixer == 0 || mixer == 1 || mixer == 2)) {
+                   (mixer == 0 || mixer == 1 || mixer == 2) &&
+                   (arg >= 0 && arg <= 100)) {
                   gMixer[channel][i] = (enabled) ? (mixer + 1) : (0);
+                  gVolumes[channel][i] = ((float)arg) * 0.01f;
                   Comm_Transmit(&gCommData, "OK");
                 }
               }
