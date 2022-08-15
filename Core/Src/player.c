@@ -419,11 +419,31 @@ void player_start(void)
   memset(gTdmFinalBuffers, 0, sizeof(gTdmFinalBuffers));
   memset(gMixer, 0, sizeof(gMixer));
 
+  // Default Mixer configuration
+  for(int pl = 0; pl < 16; pl++) {
+    gMixer[0][pl] = 2; //Left
+    gMixer[2][pl] = 3; //Right
+  }
+  for(int pl = 16; pl < 20; pl++) {
+    gMixer[4][pl] = 2; //Left
+    gMixer[6][pl] = 3; //Right
+  }
+  for(int pl = 20; pl < 28; pl++) {
+    gMixer[8][pl] = 2; //Left
+    gMixer[10][pl] = 3; //Right
+  }
+  for(int pl = 28; pl < 30; pl++) {
+    gMixer[12][pl] = 2; //Left
+    gMixer[14][pl] = 3; //Right
+  }
+  for(int pl = 30; pl < 32; pl++) {
+    gMixer[16][pl] = 2; //Left
+    gMixer[18][pl] = 3; //Right
+  }
+
   gFSMutex = osMutexNew(&mutexFS_attributes);
   for(int i = 0; i < PLAYERS_COUNT; i++) {
     memset(&playersdata->player[i], 0, sizeof(playersdata->player[i]));
-    if(i * 2 < CHANNELS_COUNT)
-      gMixer[i * 2][i] = 1;
 
     str = (char *)pvPortMalloc(12); sprintf(str, "player%d", i+1); playersdata->player[i].name = str;
     str = (char *)pvPortMalloc(16); sprintf(str, "mutexPlayer%d", i+1); mutexPlayer_attributes.name = str;
