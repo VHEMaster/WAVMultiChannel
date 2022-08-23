@@ -187,7 +187,7 @@ static void HandleSaiDma(int16_t *buffer[TDM_COUNT], uint32_t size)
   int32_t sample;
   int32_t mono;
   int16_t *samples;
-  uint32_t players;
+  int32_t players;
 
   DEBUG_PERIOD = TICK_US - debug_time;
   debug_time = TICK_US;
@@ -419,7 +419,8 @@ void player_start(void)
   for(int i = 0; i < TDM_COUNT; i++)
     HAL_SAI_TxHalfCpltCallback(gSai[i]);
   for(int i = 0; i < TDM_COUNT; i++)
-    HAL_SAI_TxHalfCpltCallback(gSai[i]);
+    HAL_SAI_TxCpltCallback(gSai[i]);
+
   for(int i = 1; i < TDM_COUNT; i++)
     HAL_SAI_Transmit_DMA(gSai[i], (uint8_t *)gTdmFinalBuffers[i], TDM_BUFFER_SIZE);
   if(TDM_COUNT > 0)
