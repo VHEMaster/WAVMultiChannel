@@ -187,6 +187,7 @@ static void HandleSaiDma(int16_t *buffer[TDM_COUNT], uint32_t size)
   int32_t sample;
   int32_t mono;
   int16_t *samples;
+  uint32_t players;
 
   DEBUG_PERIOD = TICK_US - debug_time;
   debug_time = TICK_US;
@@ -194,12 +195,14 @@ static void HandleSaiDma(int16_t *buffer[TDM_COUNT], uint32_t size)
   memset(gPlayersAvailable, 0, sizeof(gPlayersAvailable));
 
   for(int tdm = 0; tdm < TDM_COUNT; tdm++) {
+    players = 0;
     for(int lch = 0; lch < CHANNELS_PER_TDM; lch++) {
       channel = tdm * CHANNELS_PER_TDM + lch;
 
       for(int player = 0; player < PLAYERS_COUNT; player++) {
         if(gMixer[channel][player]) {
           samples = NULL;
+          players++;
 
           if(gPlayersData.player[player].channels == 1) {
             samples = gPlayersTempBufferL[player];
@@ -253,12 +256,19 @@ static void HandleSaiDma(int16_t *buffer[TDM_COUNT], uint32_t size)
           }
         }
       }
-      for(int i = 0; i < samples_per_channel; i++) {
-        sample = gChannelSamples[i];
-        if(sample > SHRT_MAX) sample = SHRT_MAX;
-        else if(sample < SHRT_MIN) sample = SHRT_MIN;
-        buffer[tdm][i * CHANNELS_PER_TDM + lch] = sample;
-        gChannelSamples[i] = 0;
+      if(players) {
+        for(int i = 0; i < samples_per_channel; i++) {
+          sample = gChannelSamples[i] / players;
+          if(sample > SHRT_MAX) sample = SHRT_MAX;
+          else if(sample < SHRT_MIN) sample = SHRT_MIN;
+          buffer[tdm][i * CHANNELS_PER_TDM + lch] = sample;
+          gChannelSamples[i] = 0;
+        }
+      } else {
+        for(int i = 0; i < samples_per_channel; i++) {
+          buffer[tdm][i * CHANNELS_PER_TDM + lch] = 0;
+          gChannelSamples[i] = 0;
+        }
       }
 
 
@@ -401,6 +411,11 @@ void player_start(void)
   HAL_GPIO_WritePin(LED2_YELLOW_GPIO_Port, LED2_YELLOW_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(LED3_RED_GPIO_Port, LED3_RED_Pin, GPIO_PIN_RESET);
 
+  for(int i = 0; i < TDM_COUNT; i++) {
+    gSai[i]->Init.MckOverSampling = SAI_MCK_OVERSAMPLING_ENABLE;
+    HAL_SAI_Init(gSai[i]);
+  }
+
   for(int i = 0; i < TDM_COUNT; i++)
     HAL_SAI_TxHalfCpltCallback(gSai[i]);
   for(int i = 0; i < TDM_COUNT; i++)
@@ -423,22 +438,32 @@ void player_start(void)
   for(int pl = 0; pl < 16; pl++) {
     gMixer[0][pl] = 2; //Left
     gMixer[2][pl] = 3; //Right
+    gMixer[0+32][pl] = 2; //Left
+    gMixer[2+32][pl] = 3; //Right
   }
   for(int pl = 16; pl < 20; pl++) {
     gMixer[4][pl] = 2; //Left
     gMixer[6][pl] = 3; //Right
+    gMixer[4+32][pl] = 2; //Left
+    gMixer[6+32][pl] = 3; //Right
   }
   for(int pl = 20; pl < 28; pl++) {
     gMixer[8][pl] = 2; //Left
     gMixer[10][pl] = 3; //Right
+    gMixer[8+32][pl] = 2; //Left
+    gMixer[10+32][pl] = 3; //Right
   }
   for(int pl = 28; pl < 30; pl++) {
     gMixer[12][pl] = 2; //Left
     gMixer[14][pl] = 3; //Right
+    gMixer[12+32][pl] = 2; //Left
+    gMixer[14+32][pl] = 3; //Right
   }
   for(int pl = 30; pl < 32; pl++) {
     gMixer[16][pl] = 2; //Left
     gMixer[18][pl] = 3; //Right
+    gMixer[16+32][pl] = 2; //Left
+    gMixer[18+32][pl] = 3; //Right
   }
 
   gFSMutex = osMutexNew(&mutexFS_attributes);
