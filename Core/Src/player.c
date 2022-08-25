@@ -195,14 +195,13 @@ static void HandleSaiDma(int16_t *buffer[TDM_COUNT], uint32_t size)
   memset(gPlayersAvailable, 0, sizeof(gPlayersAvailable));
 
   for(int tdm = 0; tdm < TDM_COUNT; tdm++) {
-    players = 0;
     for(int lch = 0; lch < CHANNELS_PER_TDM; lch++) {
+      players = 0;
       channel = tdm * CHANNELS_PER_TDM + lch;
 
       for(int player = 0; player < PLAYERS_COUNT; player++) {
         if(gMixer[channel][player]) {
           samples = NULL;
-          players++;
 
           if(gPlayersData.player[player].channels == 1) {
             samples = gPlayersTempBufferL[player];
@@ -221,6 +220,7 @@ static void HandleSaiDma(int16_t *buffer[TDM_COUNT], uint32_t size)
             }
           }
           if(gPlayersAvailable[player] > 0) {
+            players++;
             if(gPlayersAvailable[player] == 1) {
               gPlayersAvailable[player] = 2;
 
@@ -258,7 +258,7 @@ static void HandleSaiDma(int16_t *buffer[TDM_COUNT], uint32_t size)
       }
       if(players) {
         for(int i = 0; i < samples_per_channel; i++) {
-          sample = gChannelSamples[i] / players;
+          sample = gChannelSamples[i] / players / 4;
           if(sample > SHRT_MAX) sample = SHRT_MAX;
           else if(sample < SHRT_MIN) sample = SHRT_MIN;
           buffer[tdm][i * CHANNELS_PER_TDM + lch] = sample;
